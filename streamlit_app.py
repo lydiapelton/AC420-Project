@@ -19,6 +19,7 @@ HOW THE FILE IS ORGANIZED (read top to bottom)
 """
 
 import io
+import time
 import zipfile
 import urllib.request
 
@@ -28,7 +29,7 @@ import yfinance as yf
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.linear_model import LinearRegression
+import statsmodels.api as sm
 from sklearn.covariance import LedoitWolf
 from scipy.optimize import minimize, linprog
 
@@ -37,7 +38,11 @@ from scipy.optimize import minimize, linprog
 # 1. ASSUMPTIONS  (change these here; the whole app uses them)
 # =============================================================================
 
-# Fama-French factor file (monthly Mkt-RF, SMB, HML, RF). Same data WRDS distributes.
+# Fama-French factors (monthly Mkt-RF, SMB, HML, RF) used to TRAIN the models:
+# 1st choice: a CSV downloaded from WRDS (Fama-French Factors - Monthly Frequency),
+# saved as WRDS_FF_FILE in the same folder as app.py.
+WRDS_FF_FILE = "wrds_ff_factors.csv"
+# Backup only (if the WRDS file is missing): the same factors from the Ken French Data Library
 FF_URL = ("https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
           "F-F_Research_Data_Factors_CSV.zip")
 # Backup: if the download fails, put the CSV from the Ken French site in the app folder
@@ -47,9 +52,6 @@ FF_LOCAL_FILE = "F-F_Research_Data_Factors.csv"
 # the start date Fama & French (1993) use in their original paper.
 PREMIUM_START = "1963-07"
 
-# Blume (1971) adjustment: forecast beta = 0.67 x historical beta + 0.33 x 1.0
-# (betas tend to drift toward 1 over time). Used for the CAPM beta.
-BLUME_WEIGHT = 0.67
 
 # History window for the regressions. 5 years of monthly data (60 points)
 # is the most common choice for beta estimates.
@@ -74,6 +76,14 @@ CASH_ALIASES = {"CASH", "T-BILLS", "TBILLS", "T-BILL", "TBILL"}
 MAX_CASH = 0.75          # at most 75% in T-bills: this is a stock advisor
 MIN_CASH = 0.02          # don't bother with T-bills below 2% of the portfolio
 
+# Improve tab: how many candidate stocks get the full test for each substitution / addition
+SHORTLIST_SIZE = 40
+# Largest recommended position in one company (one-issuer limit for diversified funds, IRC 851(b)(3))
+MAX_POSITION_CAP = 0.25
+# A new stock is only added if it improves the optimizer's score by at least this much
+# ("only add stocks when necessary")
+MIN_ADD_GAIN = 0.002
+
 # Chart colors: each stock keeps the same color in every chart; T-bills are gray
 PALETTE = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B", "#B279A2",
            "#FF9DA6", "#9D755D", "#1F77B4", "#FF7F0E", "#2CA02C", "#D62728", "#9467BD",
@@ -82,12 +92,20 @@ PALETTE = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B", "#B
            "#637939", "#8C6D31"]
 CASH_COLOR = "#9E9E9E"
 MARKET_COLOR = "#F08C00"   # the "market" marker on the Sharpe gauge (visible in light and dark mode)
+BAR_COLOR = "#2F6DB5"      # the blue bar on the Sharpe gauge = the portfolio's Sharpe
 
 
 # =============================================================================
 # 2. STOCK UNIVERSE  ticker: (company, sector, size group)
 # =============================================================================
-UNIVERSE = {
+# The universe = every S&P 500 stock (downloaded from Wikipedia's list when the app
+# starts) + the 18 small & mid-size companies below. The S&P 500 is all large companies,
+# so the small/mid names give the Fama-French size tilt something to work with.
+SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+SP500_BACKUP_CSV = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+
+# Backup list, used only if the S&P 500 list can't be downloaded (and for the small/mid names)
+BACKUP_UNIVERSE = {
     # ---- Large companies
     "DUK": ("Duke Energy", "Utilities", "Large"), "SO": ("Southern Co", "Utilities", "Large"),
     "NEE": ("NextEra Energy", "Utilities", "Large"), "AEP": ("American Electric Power", "Utilities", "Large"),
@@ -141,6 +159,42 @@ UNIVERSE = {
     "RUN": ("Sunrun", "Utilities", "Small/Mid"),
     "VSAT": ("Viasat", "Communication", "Small/Mid"),
 }
+SMALL_MID = {t: v for t, v in BACKUP_UNIVERSE.items() if v[2] == "Small/Mid"}
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading the list of S&P 500 companies...")
+def load_universe():
+    """-> ({ticker: (company, GICS sector, size group)}, where the list came from).
+    1st choice: Wikipedia's S&P 500 table. 2nd: the GitHub 'datasets' copy of it.
+    Last resort: the backup list above."""
+    sp, source = None, None
+    try:
+        req = urllib.request.Request(SP500_URL, headers={"User-Agent": "Mozilla/5.0 (AC420 class project)"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            sp = pd.read_html(io.StringIO(r.read().decode("utf-8")))[0]
+        source = "Wikipedia, List of S&P 500 companies"
+    except Exception:
+        try:
+            sp = pd.read_csv(SP500_BACKUP_CSV)
+            source = "GitHub datasets/s-and-p-500-companies"
+        except Exception:
+            sp = None
+
+    universe = {}
+    if sp is not None and {"Symbol", "Security", "GICS Sector"} <= set(sp.columns):
+        for _, r in sp.iterrows():
+            t = str(r["Symbol"]).strip().upper().replace(".", "-")   # BRK.B -> BRK-B (Yahoo format)
+            universe[t] = (str(r["Security"]), str(r["GICS Sector"]), "Large")
+    if len(universe) < 400:   # download failed or looked wrong -> use the backup list
+        universe = {t: v for t, v in BACKUP_UNIVERSE.items() if v[2] == "Large"}
+        source = "built-in backup list of 60 large companies (the S&P 500 list couldn't be downloaded)"
+    for t, v in SMALL_MID.items():
+        universe.setdefault(t, v)
+    return universe, source
+
+
+# Replaced with the full list when the app starts (section 12)
+UNIVERSE, UNIVERSE_SOURCE = dict(BACKUP_UNIVERSE), "built-in list"
 
 # Example portfolio pre-filled in Tab 2 (tech-heavy, so the app has something to fix)
 EXAMPLE_HOLDINGS = [("AAPL", 3000.0), ("MSFT", 2500.0), ("NVDA", 2000.0), ("TSLA", 1500.0), ("JPM", 1000.0)]
@@ -162,24 +216,44 @@ def sector(t):
 # 3. DATA
 # =============================================================================
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Downloading stock prices from Yahoo Finance...")
+@st.cache_data(ttl=12 * 3600,
+               show_spinner="Downloading 11 years of prices for ~520 stocks from Yahoo Finance "
+                            "(about a minute the first time, then instant)...")
 def download_prices(tickers):
     """Monthly adjusted closing prices (dividends and splits included), last 11 years.
-    Index = calendar month, so it lines up with the Fama-French months."""
-    try:
-        raw = yf.download(list(tickers), period="11y", interval="1mo",
-                          auto_adjust=True, progress=False)
-        close = raw["Close"]
-    except Exception:
+    Index = calendar month, so it lines up with the Fama-French months.
+    Downloads in batches of 100 with a short pause, so Yahoo is less likely to block us."""
+    tickers = list(tickers)
+    frames = []
+    for i in range(0, len(tickers), 100):
+        chunk = tickers[i:i + 100]
+        for attempt in range(2):                 # one retry per batch
+            try:
+                raw = yf.download(chunk, period="11y", interval="1mo",
+                                  auto_adjust=True, progress=False, threads=True)
+                close = raw["Close"]
+                if isinstance(close, pd.Series):
+                    close = close.to_frame(name=chunk[0])
+                frames.append(_to_months(close))
+                break
+            except Exception:
+                time.sleep(3)
+        time.sleep(1)
+    if not frames:
         return pd.DataFrame()
-    if isinstance(close, pd.Series):
-        close = close.to_frame(name=tickers[0])
+    close = pd.concat(frames, axis=1)
+    close = close.loc[:, ~close.columns.duplicated()]
+    return close.dropna(axis=1, how="all")
+
+
+def _to_months(close):
+    """Label each row by calendar month and keep one row per month."""
     idx = pd.to_datetime(close.index)
     if idx.tz is not None:
         idx = idx.tz_localize(None)
+    close = close.copy()
     close.index = idx.to_period("M")
-    close = close[~close.index.duplicated(keep="last")]
-    return close.dropna(axis=1, how="all")
+    return close[~close.index.duplicated(keep="last")]
 
 
 @st.cache_data(ttl=6 * 3600)
@@ -207,19 +281,46 @@ def parse_ff_csv(text):
     return df.astype(float) / 100
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner="Downloading Fama-French factors...")
+def parse_wrds_csv(path):
+    """WRDS 'Fama-French Factors - Monthly Frequency' download. Columns include a date column
+    (e.g. 'dateff' or 'date') and mktrf, smb, hml, rf. WRDS gives decimals (0.0289);
+    if the file is in percent (2.89) we divide by 100."""
+    df = pd.read_csv(path)
+    cols = {c.strip().lower(): c for c in df.columns}
+    date_col = next(cols[c] for c in cols if "date" in c)
+    raw_dates = df[date_col].astype(str).str.strip()
+    try:
+        dates = pd.to_datetime(raw_dates, format="%Y%m%d")
+    except Exception:
+        dates = pd.to_datetime(raw_dates)
+    out = pd.DataFrame({"Mkt-RF": df[cols["mktrf"]], "SMB": df[cols["smb"]],
+                        "HML": df[cols["hml"]], "RF": df[cols["rf"]]}).astype(float)
+    if out["Mkt-RF"].abs().mean() > 0.2:      # looks like percent, not decimals
+        out = out / 100
+    out.index = pd.PeriodIndex(dates, freq="M")
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out.dropna()
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading Fama-French factors...")
 def load_fama_french():
+    """1st: the WRDS file in the app folder. 2nd (backup): Ken French website. 3rd: Ken French local file."""
+    try:
+        ff = parse_wrds_csv(WRDS_FF_FILE)
+        return ff, f"WRDS, Fama-French Factors (monthly), {ff.index[0].strftime('%m/%Y')}–{ff.index[-1].strftime('%m/%Y')}"
+    except Exception:
+        pass
     try:
         req = urllib.request.Request(FF_URL, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as r:
             data = r.read()
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             text = z.read(z.namelist()[0]).decode("latin-1")
-        return parse_ff_csv(text), "Kenneth French Data Library (downloaded live)"
+        return parse_ff_csv(text), "Kenneth French Data Library (backup: WRDS file not found)"
     except Exception:
         try:
             with open(FF_LOCAL_FILE, encoding="latin-1") as f:
-                return parse_ff_csv(f.read()), f"Kenneth French Data Library (local file {FF_LOCAL_FILE})"
+                return parse_ff_csv(f.read()), "Kenneth French Data Library (backup: WRDS file not found)"
         except Exception:
             return None, None
 
@@ -236,12 +337,20 @@ def build_model(window_years, extra_tickers=()):
     Then expected returns, volatility, stock Sharpe and the covariance matrix."""
     ff, ff_source = load_fama_french()
     if ff is None:
-        return {"error": "Couldn't download the Fama-French factors. Download "
-                         "'F-F_Research_Data_Factors_CSV.zip' from the Ken French Data Library, "
-                         f"unzip it, and put {FF_LOCAL_FILE} in the same folder as app.py."}
+        return {"error": "Couldn't load the Fama-French factors. Download them from WRDS "
+                         "(Fama-French Factors - Monthly Frequency, CSV) and save the file as "
+                         f"{WRDS_FF_FILE} in the same folder as app.py."}
 
+    # The universe is downloaded once and cached. Stocks a user types in that aren't in
+    # the universe are downloaded separately, so a new portfolio doesn't re-download ~520 stocks.
     tickers = tuple(sorted(set(UNIVERSE) | set(extra_tickers)))
-    prices = download_prices(tickers)
+    prices = download_prices(tuple(sorted(UNIVERSE)))
+    others = tuple(sorted(set(extra_tickers) - set(UNIVERSE)))
+    if others and not prices.empty:
+        more = download_prices(others)
+        if not more.empty:
+            prices = pd.concat([prices, more], axis=1)
+            prices = prices.loc[:, ~prices.columns.duplicated()]
     if prices.empty:
         return {"error": "Couldn't download prices from Yahoo Finance. Wait a minute and refresh."}
     returns = prices.pct_change(fill_method=None)
@@ -259,24 +368,25 @@ def build_model(window_years, extra_tickers=()):
     R = R[complete]
     excess = R.sub(F["RF"], axis=0)
 
-    X_capm = F[["Mkt-RF"]].values
-    X_ff = F[["Mkt-RF", "SMB", "HML"]].values
+    # Same regressions as the class notebook (Lectures 12 & 13), with statsmodels OLS:
+    #   CAPM:  y = Ret - Rf,  X = add_constant(mktrf)
+    #   FF3:   y = Ret - Rf,  X = add_constant(mktrf, smb, hml)
+    X_capm = sm.add_constant(F[["Mkt-RF"]])
+    X_ff = sm.add_constant(F[["Mkt-RF", "SMB", "HML"]])
     rows = []
     for t in complete:
-        y = excess[t].values
-        capm = LinearRegression().fit(X_capm, y)
-        ff3 = LinearRegression().fit(X_ff, y)
-        raw_beta = capm.coef_[0]
+        y = excess[t]
+        capm = sm.OLS(y, X_capm).fit()
+        ff3 = sm.OLS(y, X_ff).fit()
         rows.append({
             "Ticker": t, "Company": company(t), "Sector": sector(t),
-            "Beta (raw)": raw_beta,
-            "Beta (adj)": BLUME_WEIGHT * raw_beta + (1 - BLUME_WEIGHT) * 1.0,
-            # alpha = average monthly return beyond what CAPM predicts, x12 = per year.
+            "Beta": capm.params["Mkt-RF"],        # the CAPM regression slope
+            # alpha = the constant: average monthly return beyond what CAPM predicts, x12 = per year.
             # SHOWN in the app, NOT used to pick stocks (past alpha rarely repeats, Lectures 17-18)
-            "Alpha": capm.intercept_ * 12,
-            "CAPM R2": capm.score(X_capm, y),
-            "FF Mkt": ff3.coef_[0], "FF SMB": ff3.coef_[1], "FF HML": ff3.coef_[2],
-            "FF R2": ff3.score(X_ff, y),
+            "Alpha": capm.params["const"] * 12,
+            "CAPM R2": capm.rsquared,
+            "FF Mkt": ff3.params["Mkt-RF"], "FF SMB": ff3.params["SMB"], "FF HML": ff3.params["HML"],
+            "FF R2": ff3.rsquared,
         })
     stats = pd.DataFrame(rows).set_index("Ticker")
 
@@ -292,7 +402,7 @@ def build_model(window_years, extra_tickers=()):
         rf_source = "latest 1-month T-bill rate in the Fama-French file, annualized"
 
     # Expected returns (we assume alpha = 0 going forward: past alpha rarely repeats)
-    stats["CAPM E[R]"] = rf + stats["Beta (adj)"] * prem["MKT"]
+    stats["CAPM E[R]"] = rf + stats["Beta"] * prem["MKT"]
     stats["FF E[R]"] = (rf + stats["FF Mkt"] * prem["MKT"] + stats["FF SMB"] * prem["SMB"]
                         + stats["FF HML"] * prem["HML"])
     stats["Volatility"] = R.std() * np.sqrt(12)
@@ -318,7 +428,7 @@ def build_model(window_years, extra_tickers=()):
 def _arrays(tickers, model):
     s = model["stats"].loc[list(tickers)]
     cov = model["cov"].loc[list(tickers), list(tickers)].values
-    return (s["Beta (adj)"].values, s["FF SMB"].values, s["FF HML"].values,
+    return (s["Beta"].values, s["FF SMB"].values, s["FF HML"].values,
             s["FF E[R]"].values, cov)
 
 
@@ -336,7 +446,7 @@ def port_metrics(w, tickers, model):
     vol = float(np.sqrt(w @ cov @ w))
     ff_er = float(w @ s["FF E[R]"].values) + cash * rf
     return {
-        "beta": float(w @ s["Beta (adj)"].values),
+        "beta": float(w @ s["Beta"].values),
         "mkt": float(w @ s["FF Mkt"].values),
         "smb": float(w @ s["FF SMB"].values),
         "hml": float(w @ s["FF HML"].values),
@@ -360,11 +470,13 @@ def beta_range(betas, w_min, w_max):
 
 
 def recommended_limits(n):
-    """No position smaller than half, or bigger than double, an equal share (1/n).
-    Keeps the portfolio diversified while letting the optimizer tilt. Rounded to 0.5%."""
+    """No position smaller than half, or bigger than double, an equal share (1/n),
+    and never more than 25% in one company: the same one-issuer limit U.S. tax rules
+    set for diversified mutual funds (IRC Sec. 851(b)(3)). For 2-3 stocks the cap has to
+    be higher, since the weights must still add up to 100%. Rounded to 0.5%."""
     w_min = min(0.5 / n, 0.20)
-    w_max = min(1.0, max(2.0 / n, 0.05))
-    return round(w_min * 200) / 200, round(w_max * 200) / 200
+    w_max = max(min(2.0 / n, MAX_POSITION_CAP), 1.0 / n, 0.05)
+    return np.floor(w_min * 200) / 200, min(1.0, np.ceil(w_max * 200) / 200)
 
 
 def limits_ok(n, w_min, w_max):
@@ -416,7 +528,7 @@ def pick_beginner_stocks(model, target_beta, n, seed):
     Shuffle (seed > 0): pick N at random from the same pool instead."""
     s = model["stats"]
     pool_size = min(len(s), 2 * n)
-    pool = (s["Beta (adj)"] - target_beta).abs().nsmallest(pool_size).index.tolist()
+    pool = (s["Beta"] - target_beta).abs().nsmallest(pool_size).index.tolist()
     if seed == 0:
         picks = s.loc[pool, "Sharpe"].nlargest(n).index.tolist()
     else:
@@ -482,7 +594,7 @@ def best_portfolio(tickers, model, target_beta, w_min, w_max, allow_cash):
          (We don't borrow money to go above the mix.)
     Position limits apply to the stock part. Returned weights are shares of the TOTAL
     portfolio (they add up to the stock share; the rest is T-bills)."""
-    b = model["stats"].loc[list(tickers), "Beta (adj)"].values
+    b = model["stats"].loc[list(tickers), "Beta"].values
     if allow_cash:
         w_t = tangency(tickers, model, w_min, w_max)
         mix_beta = float(w_t @ b)
@@ -599,6 +711,18 @@ def recommended_settings(holdings, window, extra, allow_cash):
     }
 
 
+def shortlist(stats, exclude, targets, k=SHORTLIST_SIZE):
+    """Quick first screen before the full search (testing all ~520 stocks would be slow):
+    fit = stock Sharpe - 0.5 x (distance of the stock's beta, size and value from your goals).
+    Keeps the k stocks with the best fit; each is then tested properly with the optimizer."""
+    pool = stats.drop(index=[t for t in exclude if t in stats.index])
+    distance = ((pool["Beta"] - targets["beta"]).abs()
+                + (pool["FF SMB"] - targets["smb"]).abs()
+                + (pool["FF HML"] - targets["hml"]).abs())
+    fit = pool["Sharpe"] - 0.5 * distance
+    return fit.nlargest(k).index.tolist()
+
+
 def targets_met(m, targets):
     return {
         "beta": abs(m["beta"] - targets["beta"]) <= TOLERANCE["beta"],
@@ -609,26 +733,61 @@ def targets_met(m, targets):
 
 
 @st.cache_data(show_spinner="Finding the best adjustments to your portfolio...")
-def recommend(holdings, window, extra, targets_tuple, w_min, w_max, max_swaps, seed, allow_cash):
-    """Step 1: reweight the stocks you already own (and T-bills, if allowed).
-    Step 2: if goals still aren't met, swap out your holding with the lowest stock Sharpe.
-            Every stock in the universe is tried as its replacement (weights re-optimized
-            each time); the one that gets closest to your goals wins. If no replacement
-            helps, the next-weakest holding is tried (up to 3).
-            Shuffle (seed > 0): choose at random among the 5 best replacements instead.
-    Repeats step 2 up to max_swaps times, stopping early once goals are met."""
+def recommend(holdings, window, extra, targets_tuple, w_min, w_max, max_swaps, seed, allow_cash,
+              new_money=0.0, max_add=0):
+    """Least disruptive changes first:
+    Step 1: REWEIGHT the stocks you already own (and T-bills, if allowed), including how
+            to invest any new money.
+    Step 2: ADD new stocks (only with new money, up to max_add) if goals still aren't met.
+            Nothing has to be sold. A stock is added only if it improves the score by at
+            least MIN_ADD_GAIN, so stocks are added only when necessary.
+    Step 3: SUBSTITUTE if goals still aren't met: swap out your holding with the lowest stock
+            Sharpe. The 40 best-fitting stocks (see shortlist) are each tried as its
+            replacement (weights re-optimized each time); the one that gets closest to your
+            goals wins. If no replacement helps, the next-weakest holding is tried (up to 3).
+    Shuffle (seed > 0): choose at random among the 5 best candidates instead.
+    Steps 2 and 3 repeat up to max_add / max_swaps times, stopping early once goals are met.
+
+    New money: weights are shares of (current value + new money). What you own today, as a
+    share of that new total, is the starting point; changes from it count as turnover."""
     model = build_model(window, extra)
     stats = model["stats"]
     good, _, cash = split_holdings(holdings, model)
     original, dollars, w_cur, c_cur, total = current_weights(good, cash)
     targets = dict(zip(["beta", "sharpe", "smb", "hml"], targets_tuple))
+    new_total = total + new_money
 
-    current, base = list(original), w_cur.copy()
-    w, c, score = soft_optimize(current, base, c_cur, targets, model, w_min, w_max, allow_cash)
+    current = list(original)
+    base = dollars / new_total          # what you own today, as a share of the new total
+    base_c = cash / new_total
+    w, c, score = soft_optimize(current, base, base_c, targets, model, w_min, w_max, allow_cash)
     reweight_metrics = port_metrics(w, current, model)
     rng = np.random.default_rng(seed)
-    swaps, removed = [], set()
+    swaps, adds, removed = [], [], set()
 
+    # ---- Step 2: add new stocks (only when there's new money, and only if it helps enough)
+    for _ in range(max_add if new_money > 0 else 0):
+        if all(targets_met(port_metrics(w, current, model), targets).values()):
+            break
+        if (len(current) + 1) * w_min > 1:      # one more stock wouldn't fit the minimum position
+            break
+        nb = np.append(base, 0.0)               # the new stock starts from $0
+        trials = []
+        for cand_t in shortlist(stats, set(current) | removed, targets):
+            wn, cn, sn = soft_optimize(current + [cand_t], nb, base_c, targets, model,
+                                       w_min, w_max, allow_cash)
+            trials.append((sn, cand_t, wn, cn))
+        improving = sorted([t for t in trials if t[0] < score - MIN_ADD_GAIN], key=lambda x: x[0])
+        if not improving:
+            break
+        k = 0 if seed == 0 else int(rng.integers(min(5, len(improving))))
+        new_score, new_t, wn, cn = improving[k]
+        adds.append({"in": new_t, "alternatives": [t[1] for t in improving[:6] if t[1] != new_t][:3]})
+        current = current + [new_t]
+        base = nb
+        w, c, score = wn, cn, new_score
+
+    # ---- Step 3: substitute
     for _ in range(max_swaps):
         if all(targets_met(port_metrics(w, current, model), targets).values()):
             break
@@ -641,12 +800,10 @@ def recommend(holdings, window, extra, targets_tuple, w_min, w_max, max_swaps, s
             new_base = base.copy()
             new_base[i] = 0.0                          # new stock starts from 0%
             trials = []
-            for cand_t in stats.index:
-                if cand_t in current or cand_t in removed:
-                    continue
+            for cand_t in shortlist(stats, set(current) | removed, targets):
                 cand = list(current)
                 cand[i] = cand_t
-                wn, cn, sn = soft_optimize(cand, new_base, c_cur, targets, model, w_min, w_max, allow_cash)
+                wn, cn, sn = soft_optimize(cand, new_base, base_c, targets, model, w_min, w_max, allow_cash)
                 trials.append((sn + sell_penalty, cand_t, wn, cn))
             improving = sorted([t for t in trials if t[0] < score - 1e-4], key=lambda x: x[0])
             if improving:
@@ -665,8 +822,9 @@ def recommend(holdings, window, extra, targets_tuple, w_min, w_max, max_swaps, s
 
     return {
         "original": original, "w_cur": w_cur, "c_cur": c_cur, "total": float(total),
+        "new_money": float(new_money), "new_total": float(new_total),
         "dollars_cur": dollars, "cash_cur": float(cash),
-        "final": current, "w_final": w, "c_final": c, "swaps": swaps,
+        "final": current, "w_final": w, "c_final": c, "swaps": swaps, "adds": adds,
         "before": port_metrics(w_cur, original, model),
         "reweight": reweight_metrics,
         "after": port_metrics(w, current, model),
@@ -726,14 +884,17 @@ def sharpe_gauge(value, market_sharpe, title="Sharpe ratio", reference=None):
         delta={"reference": reference, "valueformat": ".2f"} if reference is not None else None,
         title={"text": f"{title}: {sharpe_band(value)}", "font": {"size": 17}},
         domain={"x": [0, 1], "y": [0, 1]},
-        gauge={"axis": {"range": [0, top]}, "bar": {"color": "#1f4e79", "thickness": 0.35},
+        gauge={"axis": {"range": [0, top]}, "bar": {"color": BAR_COLOR, "thickness": 0.35},
                "steps": steps,
                "threshold": {"line": {"color": MARKET_COLOR, "width": 5}, "thickness": 0.9,
                              "value": market_sharpe}}))
+    fig.add_annotation(text=f"<b>Blue bar</b> = this portfolio's Sharpe ({value:.2f})",
+                       x=0.5, y=-0.09, xref="paper", yref="paper", showarrow=False,
+                       font={"size": 12, "color": BAR_COLOR})
     fig.add_annotation(text=f"<b>Orange line</b> = stock market's Sharpe ({market_sharpe:.2f})",
-                       x=0.5, y=-0.12, xref="paper", yref="paper", showarrow=False,
+                       x=0.5, y=-0.19, xref="paper", yref="paper", showarrow=False,
                        font={"size": 12, "color": MARKET_COLOR})
-    fig.update_layout(height=300, margin=dict(t=70, b=45, l=35, r=35))
+    fig.update_layout(height=320, margin=dict(t=70, b=65, l=35, r=35))
     return fig
 
 
@@ -742,8 +903,10 @@ def sharpe_explanation(m, model):
         f"**Sharpe ratio = (expected return − risk-free rate) ÷ volatility**  \n"
         f"= ({m['ff_er']:.2%} − {model['rf']:.2%}) ÷ {m['vol']:.2%} = **{m['sharpe']:.2f}**")
     explain("It measures how much extra return you expect for each unit of risk. Higher is better. "
-            f"The orange line is the overall stock market ({model['market_sharpe']:.2f}) "
-            "using the same assumptions. The color bands are our rule-of-thumb labels.")
+            f"The **blue bar** fills up to this portfolio's Sharpe ratio ({m['sharpe']:.2f}). "
+            f"The **orange line** is the overall stock market ({model['market_sharpe']:.2f}) using the same "
+            "assumptions, so a blue bar past the orange line means better return per unit of risk than the market. "
+            "The color bands are our rule-of-thumb labels.")
 
 
 def return_waterfall(m, model):
@@ -784,8 +947,8 @@ def ff_box(m, model):
         c2.metric("Size (SMB)", f"{m['smb']:+.2f}")
         c3.metric("Value (HML)", f"{m['hml']:+.2f}")
         st.plotly_chart(return_waterfall(m, model))
-        explain(f"**Market ({m['mkt']:.2f}):** sensitivity to the stock market, like beta. It can differ from the "
-                "CAPM beta because it's estimated together with size and value, and it isn't Blume-adjusted.")
+        explain(f"**Market ({m['mkt']:.2f}):** sensitivity to the stock market, like beta. It can differ a little from the "
+                "CAPM beta because it's estimated together with size and value.")
         explain(f"**Size / SMB ({m['smb']:+.2f}) → behaves like a {size_word(m['smb'])} portfolio.** "
                 "SMB = Small Minus Big: positive means it moves like small companies, negative like large ones. "
                 f"Small companies have historically earned {p['SMB']:.2%} a year more than large ones.")
@@ -800,8 +963,8 @@ def ff_box(m, model):
 
 def alpha_explanation(model, window_years):
     explain(f"**Alpha** = how much more (or less) a stock returned per year than CAPM predicted, over the "
-            f"last {window_years} years (Lecture 12). We **show** it but **don't use it to pick stocks**: "
-            "past alpha rarely repeats and may just be luck (Lectures 17–18), so our forecasts assume alpha = 0.")
+            f"last {window_years} years. We **show** it but **don't use it to pick stocks**: "
+            "past alpha rarely repeats and may just be luck, so our forecasts assume alpha = 0.")
 
 
 def weights_pie(labels, weights, cmap):
@@ -839,10 +1002,10 @@ def compare_bars(labels, now_pct, rec_pct):
 # =============================================================================
 
 def home_page():
-    st.subheader("Welcome! Your automated financial advisor")
+    st.subheader("Welcome to your automated financial advisor!")
     st.write("Not everyone has access to a financial advisor. This app does part of an advisor's job: "
              "it suggests **which stocks to hold, how much of each, and how much risk to take**, based on "
-             "your age and how comfortable you are with risk. Every number comes with a plain-English explanation.")
+             "your age and how comfortable you are with risk.")
 
     st.markdown("#### Which tab should I use?")
     c1, c2 = st.columns(2)
@@ -850,19 +1013,19 @@ def home_page():
         with st.container(border=True):
             st.markdown("**🌱 Start from scratch**")
             st.write("New to investing? Enter your age, risk tolerance, amount and number of stocks. "
-                     "We build a diversified portfolio and explain why we chose each stock.")
+                     "We build a diversified portfolio and explain why we chose the stocks.")
     with c2:
         with st.container(border=True):
             st.markdown("**📈 Improve my portfolio**")
             st.write("Already invest? Enter your stocks and dollar amounts. We score your portfolio and "
-                     "recommend weight changes and substitute stocks to reach your goals.")
+                     "recommend weight changes, new stocks for any new money, and substitutes to reach your goals.")
     st.caption("👆 Click a tab at the top of the page to get started.")
 
-    st.markdown("#### How it works")
+    st.markdown("#### How our recommendations work")
     st.markdown("""
-1. **Measure risk.** For each stock we run two regressions on monthly returns: **CAPM** (market risk, *beta*) and the **Fama-French 3-factor model** (market, size and value).
+1. **Measure risk.** For every **S&P 500 stock** (plus 18 small and mid-size companies) we run two regressions on monthly returns: **CAPM** (market risk, *beta*) and the **Fama-French 3-factor model** (market, size and value).
 2. **Estimate returns.** Expected return = risk-free rate + each risk exposure × that factor's long-run reward.
-3. **Match your risk.** Your age and risk slider set a *target beta*. If you want less risk than the best stock mix, we add **T-bills** (beta 0).
+3. **Match your risk.** Your age and risk slider set a *target beta*. If you want less risk than the best stock portfolio, we add **T-bills** (beta 0).
 4. **Optimize.** We choose weights with the highest **Sharpe ratio** (return per unit of risk) at your risk level.
 """)
 
@@ -874,10 +1037,15 @@ def home_page():
 - **Sharpe ratio:** (expected return − risk-free rate) ÷ volatility. Extra return per unit of risk; portfolio managers try to maximize it.
 - **Fama-French factors:** **SMB** (Small Minus Big): small companies vs. large; **HML** (High Minus Low book-to-market): value stocks vs. growth stocks.
 - **Alpha (α):** return beyond what the model predicts. We show past alpha but don't use it to forecast.
-- **T-bills:** short-term U.S. government debt. Beta 0, earns the risk-free rate. You can buy them through a T-bill ETF such as SGOV or BIL.
+- **T-bills:** short-term U.S. government debt. Beta 0, earns the risk-free rate.
 """)
     methods_section()
     st.caption("AC420 class project, not investment advice.")
+
+
+def month_label(period_str):
+    """'2021-10' -> '10/2021'"""
+    return pd.Period(period_str, "M").strftime("%m/%Y")
 
 
 def methods_section():
@@ -891,22 +1059,23 @@ def methods_section():
 **Data sources**
 | What | Source |
 |---|---|
+| Stock list | S&P 500 companies from {UNIVERSE_SOURCE}, plus 18 small/mid-size companies we added so the size factor has something to work with: **{len(model['stats'])} stocks** with enough price history |
 | Stock prices | Yahoo Finance via `yfinance`: monthly adjusted closes (include dividends and splits) |
-| Fama-French factors (Mkt-RF, SMB, HML, RF) | {model['ff_source']}, the same data WRDS distributes |
+| Fama-French factors (Mkt-RF, SMB, HML, RF), used to train the models | {model['ff_source']} |
 | Current risk-free rate | {model['rf_source']}: **{model['rf']:.2%}** |
-| Estimation window | {model['start']} to {model['end']} ({model['n_months']} months) in "Start from scratch"; 3, 5 or 10 years in "Improve my portfolio" |
+| Estimation window | **Start from scratch:** {month_label(model['start'])}–{month_label(model['end'])} ({model['n_months']} months)<br>**Improve my portfolio:** option of 3, 5 or 10 years |
 
 **Models (linear regressions, one per stock, on monthly excess returns)**
-- **CAPM:** R − RF = α + β(Mkt−RF). β is then **Blume-adjusted**: 0.67 × β + 0.33, because betas drift toward 1 over time (Blume, 1971).
+- **CAPM:** R − RF = α + β(Mkt−RF). β (the slope) is the stock's beta.
 - **Fama-French 3-factor:** R − RF = α + b(Mkt−RF) + s·SMB + h·HML.
-- **Expected returns:** CAPM: RF + β × market premium. Fama-French: RF + b × market premium + s × SMB premium + h × HML premium. We assume α = 0 going forward, because past α rarely repeats (Lectures 17–18). Past α is shown, not used.
+- **Expected returns:** CAPM: RF + β × market premium. Fama-French: RF + b × market premium + s × SMB premium + h × HML premium. We assume α = 0 going forward, because past α rarely repeats. Past α is shown, not used.
 - **Factor premiums** = average annual factor return since July 1963 (the start of Fama & French's 1993 sample): market **{p['MKT']:.2%}**, SMB **{p['SMB']:.2%}**, HML **{p['HML']:.2%}**.
 - **Risk:** covariance of monthly returns with **Ledoit-Wolf shrinkage** (reduces noise when there are many stocks and few months), × 12 to annualize. Volatility = √(w′Σw).
 - **Sharpe ratio** = (Fama-French expected return − RF) ÷ volatility. Market Sharpe for comparison: **{model['market_sharpe']:.2f}**.
-- **We pick stocks by *expected* Sharpe (from the risk model), not *past* Sharpe**, because a high past Sharpe ratio is typically unrelated to the future one (Lecture 18).
+- **We pick stocks by *expected* Sharpe (from the risk model), not *past* Sharpe**, because a high past Sharpe ratio is typically unrelated to the future one.
 
-**T-bills and the Capital Allocation Line**
-T-bills have beta 0 and earn the risk-free rate. Mixing the best (highest-Sharpe) stock portfolio with T-bills lowers risk in a straight line: portfolio beta = stock share × stock beta, and the Sharpe ratio stays the same. So when your target beta is below the best stock mix's beta, we hold that mix plus T-bills (at most {MAX_CASH:.0%} in T-bills). When your target is above it, we stay 100% in stocks at your target beta (no borrowing).
+**T-bills**
+T-bills have beta 0 and earn the risk-free rate. Mixing the best (highest-Sharpe) stock portfolio with T-bills lowers risk in a straight line: portfolio beta = stock share × stock beta, and the Sharpe ratio stays the same. So when your target beta is below the best stock portfolio's beta, we hold that portfolio plus T-bills (at most {MAX_CASH:.0%} in T-bills). When your target is above it, we stay 100% in stocks at your target beta (no borrowing).
 
 **"Start from scratch" rules (our assumptions)**
 | Age | Beta range |
@@ -916,13 +1085,13 @@ T-bills have beta 0 and earn the risk-free rate. Mixing the best (highest-Sharpe
 | 45–59 | 0.60 – 1.10 |
 | 60+ | 0.40 – 0.90 |
 
-Based on the idea behind the "110 − age = % in stocks" rule and target-date funds: more years until you need the money = more risk you can recover from. The risk slider picks a point in the range. Stocks: the 2N closest in beta, then the N best expected stock Sharpes. Each stock is between ½ and 2× an equal share of the stock part.
+Based on the idea behind the "110 − age = % in stocks" rule and target-date funds: more years until you need the money = more risk you can recover from. The risk slider picks a point in the range.
 
 **"Improve my portfolio" rules**
-Recommended goals come from the **highest-Sharpe version of your current portfolio** (same stocks, plus T-bills if allowed, at today's beta). Optimizer: minimizes 50·(beta gap)² + 20·(size gap)² + 20·(value gap)² + 50·(Sharpe shortfall)² + 1·(weight changes)². Substitutes replace the holding with the lowest expected stock Sharpe.
+Recommended goals come from the **highest-Sharpe version of your current portfolio** (same stocks, plus T-bills if allowed, at today's beta). Position limits: ½ to 2× an equal share, capped at {MAX_POSITION_CAP:.0%} per company (the one-issuer limit for diversified mutual funds under U.S. tax rules). Optimizer: minimizes 50·(beta gap)² + 20·(size gap)² + 20·(value gap)² + 50·(Sharpe shortfall)² + 1·(weight changes)². Changes are made least-disruptive first: reweight (including new money) → add new stocks with new money, only if they clearly help → substitute the holding with the lowest expected stock Sharpe.
 
-**Limitations:** estimates come from past data and may not hold in the future. The universe is {len(model['stats'])} stocks that exist today (survivorship bias). Bonds aren't included, since CAPM and Fama-French are stock models. Taxes and trading costs are ignored. The Fama-French file is published with a 1–2 month delay.
-""")
+**Limitations:** estimates come from past data and may not hold in the future. The universe is today's S&P 500 (plus 18 small/mid names): companies that survived and grew big enough to be in the index, so their past returns look better than a typical stock's (survivorship bias). Stocks without a full price history in the window (recent IPOs) are left out. Bonds aren't included, since CAPM and Fama-French are stock models. Taxes and trading costs are ignored.
+""", unsafe_allow_html=True)
         if model["missing"]:
             st.caption("Stocks in our list skipped for missing data: " + ", ".join(model["missing"]))
 
@@ -940,52 +1109,65 @@ def beginner_tab():
         st.error(model["error"])
         return
 
-    # ---------- inputs
-    with st.container(border=True):
+    # ---------- inputs: nothing happens until a button is clicked
+    st.markdown("#### Step 1: Enter your details")
+    st.caption("Adjust everything in this box, then click **Generate my portfolio** to see your results.")
+    with st.form("beg_form", border=True):
         c1, c2 = st.columns(2)
         with c1:
             age = st.number_input("Your age", min_value=18, max_value=100, value=22, step=1, key="beg_age")
-            floor, ceiling = age_risk_band(age)
-            explain(f"Your age sets the range of risk we allow: **beta {floor:.2f} to {ceiling:.2f}**. "
-                    "Younger investors have more years to recover from a market drop.")
+            explain("Your age sets the range of risk we allow. Younger investors have more years to recover "
+                    "from a market drop, so their range is higher.")
             risk = st.slider("Risk tolerance (within your age range)", 0, 100, 50, key="beg_risk")
-            target = target_beta_from_slider(age, risk)
-            explain(f"0 = safest end of your range, 100 = riskiest. Your **target beta is {target:.2f}** "
-                    "(1.0 = moves like the stock market).")
+            explain("0 = the safest end of your range, 100 = the riskiest.")
         with c2:
             amount = st.number_input("Amount to invest ($)", min_value=100, value=10_000, step=500, key="beg_amount")
             explain("We split this amount across your holdings.")
             n = st.slider("Number of stocks", 10, 30, 15, key="beg_n")
             explain("More stocks = more diversification, so one company having a bad year hurts you less.")
         allow_cash = st.checkbox("Use T-bills (cash) to lower risk when needed", value=True, key="beg_cash")
-        explain("T-bills have beta 0. If your target risk is below the best stock mix, we add T-bills instead of "
-                "settling for weaker stocks. Turn this off to stay 100% in stocks.")
+        explain("T-bills have beta 0. If your target risk is below the best stock portfolio, we add T-bills "
+                "instead of settling for weaker stocks. Turn this off to stay 100% in stocks.")
 
-    # ---------- shuffle controls
+        b1, b2, b3 = st.columns([1.4, 1, 1])
+        generate = b1.form_submit_button("Generate my portfolio", type="primary")
+        shuffle = b2.form_submit_button("🔀 Shuffle stocks")
+        back = b3.form_submit_button("↩️ Back to best picks")
+
     st.session_state.setdefault("beg_seed", 0)
-    b1, b2 = st.columns(2)
-    if b1.button("🔀 Shuffle stocks", key="beg_shuffle"):
-        st.session_state["beg_seed"] += 1
-    if b2.button("↩️ Back to best picks", key="beg_reset"):
+    st.session_state.setdefault("beg_generated", False)
+    if generate or back:
         st.session_state["beg_seed"] = 0
+        st.session_state["beg_generated"] = True
+    if shuffle:
+        st.session_state["beg_seed"] += 1
+        st.session_state["beg_generated"] = True
+    if not st.session_state["beg_generated"]:
+        st.info("👆 Adjust your details above, then click **Generate my portfolio**.")
+        return
     seed = st.session_state["beg_seed"]
 
     # ---------- model
+    floor, ceiling = age_risk_band(age)
+    target = target_beta_from_slider(age, risk)
     picks, pool = pick_beginner_stocks(model, target, n, seed)
     w_min, w_max = recommended_limits(n)
     best = best_portfolio(picks, model, target, w_min, w_max, allow_cash)
     w, cash = best["w"], best["cash"]
     m = port_metrics(w, picks, model)
 
+    st.markdown("#### Step 2: Your results")
+    st.info(f"Because you are **{age}**, your beta range is **{floor:.2f}–{ceiling:.2f}**. Your risk tolerance "
+            f"was **{risk}/100**, so your target beta is **{target:.2f}** (1.0 = moves like the stock market).")
     if seed > 0:
         st.info(f"Shuffle #{seed}: these {n} stocks were drawn at random from the {len(pool)} stocks closest "
                 "to your target beta. Shuffled portfolios usually score a little lower on the Sharpe gauge "
                 "than the best picks. Compare them!")
     if best["mode"] == "cal":
-        msg = (f"**Why T-bills?** Your target beta ({target:.2f}) is below the beta of the best stock mix "
-               f"({best['mix_beta']:.2f}). So we put **{1 - cash:.0%} in that mix and {cash:.0%} in T-bills**. "
-               f"T-bills have beta 0, so portfolio beta = {1 - cash:.2f} × {best['mix_beta']:.2f} = **{m['beta']:.2f}**. "
-               "This is the Capital Allocation Line: less risk, same (highest) Sharpe ratio.")
+        msg = (f"**Why T-bills?** Your target beta ({target:.2f}) is below the beta of the best stock portfolio "
+               f"({best['mix_beta']:.2f}). So we put **{1 - cash:.0%} in the stock portfolio and {cash:.0%} in "
+               f"T-bills**. T-bills have beta 0, so portfolio beta = {1 - cash:.2f} × {best['mix_beta']:.2f} = "
+               f"**{m['beta']:.2f}**. You get less risk with the same (highest) Sharpe ratio.")
         if abs(m["beta"] - target) > 0.005:
             msg += f" (We cap T-bills at {MAX_CASH:.0%}, so beta stays at {m['beta']:.2f}.)"
         st.info(msg)
@@ -1012,31 +1194,21 @@ def beginner_tab():
     st.markdown("### Where your money goes")
     st.plotly_chart(weights_pie(labels, weights, cmap))
 
-    # ---------- holdings table with reasons
-    st.markdown("### Your holdings and why we chose them")
+    # ---------- holdings table
+    st.markdown("### Your holdings")
     s = model["stats"]
-    pool_rank = s.loc[pool, "Sharpe"].rank(ascending=False).astype(int)
     dollars = to_dollars(weights, amount)
     pcts = to_pct(weights)
     rows = []
     for t, pct, d in zip(labels, pcts, dollars):
         if t == CASH:
-            rows.append({"Ticker": CASH, "Company": CASH_NAME, "Weight %": pct, "$ Amount": d,
-                         "Beta": 0.0, "Alpha": None, "Exp. return": round(model["rf"] * 100, 1),
-                         "Why chosen": "Beta 0, earns the risk-free rate. Lowers risk to your target without "
-                                       "lowering the Sharpe ratio (Capital Allocation Line)."})
+            rows.append({"Ticker": CASH, "Company": CASH_NAME, "Sector": "Cash", "Weight %": pct, "$ Amount": d,
+                         "Beta": 0.0, "Alpha": None, "Exp. return": round(model["rf"] * 100, 1)})
             continue
         r = s.loc[t]
-        if seed == 0:
-            why = (f"Beta {r['Beta (adj)']:.2f} is close to your target; ranked #{pool_rank[t]} of "
-                   f"{len(pool)} candidates on expected return per unit of risk (stock Sharpe {r['Sharpe']:.2f}).")
-        else:
-            why = (f"Beta {r['Beta (adj)']:.2f} is close to your target; drawn at random from the "
-                   f"{len(pool)} closest-beta stocks.")
-        rows.append({"Ticker": t, "Company": r["Company"], "Weight %": pct, "$ Amount": d,
-                     "Beta": round(r["Beta (adj)"], 2), "Alpha": round(r["Alpha"] * 100, 1),
-                     "Exp. return": round(r["FF E[R]"] * 100, 1),
-                     "Why chosen": f"{why} {r['Sector']}; {size_word(r['FF SMB'])}, {value_word(r['FF HML'])}."})
+        rows.append({"Ticker": t, "Company": r["Company"], "Sector": r["Sector"], "Weight %": pct, "$ Amount": d,
+                     "Beta": round(r["Beta"], 2), "Alpha": round(r["Alpha"] * 100, 1),
+                     "Exp. return": round(r["FF E[R]"] * 100, 1)})
     table = pd.DataFrame(rows).sort_values("Weight %", ascending=False)
     st.dataframe(table, hide_index=True, column_config={
         "Weight %": st.column_config.NumberColumn(format="%.1f%%"),
@@ -1044,6 +1216,15 @@ def beginner_tab():
         "Alpha": st.column_config.NumberColumn("Past alpha", format="%.1f%%"),
         "Exp. return": st.column_config.NumberColumn(format="%.1f%%")})
     st.write(f"**Total:** {pcts.sum():.1f}% · ${dollars.sum():,.2f}")
+    if seed == 0:
+        why = (f"**Why we chose these stocks:** out of the {len(pool)} stocks with a beta closest to your target "
+               f"({target:.2f}), these {n} have the highest expected return per unit of risk (stock Sharpe ratio).")
+    else:
+        why = (f"**Why these stocks:** drawn at random from the {len(pool)} stocks with a beta closest to your "
+               f"target ({target:.2f}).")
+    if cash > 1e-6:
+        why += " T-bills (beta 0) bring the portfolio's risk down to your target."
+    st.markdown(why)
     alpha_explanation(model, DEFAULT_WINDOW_YEARS)
 
     # ---------- CAPM and Fama-French
@@ -1051,24 +1232,25 @@ def beginner_tab():
     capm_box(m, model)
     ff_box(m, model)
     explain("We show both models. Fama-French is the one we use to pick stocks and set weights, "
-            "because it adds size and value to the market factor and explains returns better than CAPM alone (Lecture 13).")
+            "because it adds size and value to the market factor and explains returns better than CAPM alone.")
 
     # ---------- how the stocks were picked
     with st.expander("🔍 How did the model pick these stocks?"):
-        cal_step = (f"6. **T-bills:** the best stock mix has beta {best['mix_beta']:.2f}, above your target "
-                    f"{target:.2f}, so we hold {1 - cash:.0%} in it and {cash:.0%} in T-bills (Capital Allocation Line)."
-                    if best["mode"] == "cal" else
-                    "6. **T-bills:** not needed. Your target beta is at or above the best stock mix's beta, so "
-                    "you're 100% in stocks with the highest Sharpe at your target beta.")
+        cash_step = (f"6. **T-bills:** the best stock portfolio has beta {best['mix_beta']:.2f}, above your target "
+                     f"{target:.2f}, so we put **{1 - cash:.0%} in the stock portfolio and {cash:.0%} in T-bills**."
+                     if best["mode"] == "cal" else
+                     "6. **T-bills:** not needed. Your target beta is at or above the best stock portfolio's beta, so "
+                     "you're 100% in stocks with the highest Sharpe ratio at your target beta.")
         st.markdown(f"""
-1. **Universe:** {len(s)} U.S. stocks across every sector, large and small/mid-size (full list below).
-2. **Your target beta:** your age range ({floor:.2f}–{ceiling:.2f}) and risk slider ({risk}) give **{target:.2f}**.
+1. **Universe:** the S&P 500 plus 18 small and mid-size companies: {len(s)} U.S. stocks with enough price history.
+2. **Your target beta:** because you are **{age}**, your beta range is **{floor:.2f}–{ceiling:.2f}**. Your risk tolerance was **{risk}/100**, so your target beta is **{target:.2f}**.
 3. **Candidate pool:** the **{len(pool)} stocks** (2 × {n}) whose beta is closest to {target:.2f}.
 4. **Pick {n}:** the {n} with the highest *expected* stock Sharpe ratio (Fama-French expected return above the risk-free rate ÷ the stock's volatility). **Shuffle** draws {n} at random from the pool instead.
-5. **Weights:** an optimizer finds the stock weights with the **highest Sharpe ratio**, each between **{w_min:.1%} and {w_max:.1%}** of the stock part (half to double an equal share).
-{cal_step}
+5. **Weights:** an optimizer finds the stock weights with the **highest Sharpe ratio**. Each stock gets between **{w_min:.1%} and {w_max:.1%}** of the stock portfolio, so every stock is big enough to matter and no single stock dominates.
+{cash_step}
 """)
-        pool_df = s.loc[pool, ["Company", "Sector", "Beta (adj)", "Alpha", "FF E[R]", "Volatility", "Sharpe"]].copy()
+        st.markdown(f"**Pool of possible stocks** ({len(pool)} candidates; ✅ = selected for your portfolio)")
+        pool_df = s.loc[pool, ["Company", "Sector", "Beta", "Alpha", "FF E[R]", "Volatility", "Sharpe"]].copy()
         pool_df.insert(0, "Selected", ["✅" if t in picks else "" for t in pool_df.index])
         st.dataframe(pool_df.sort_values("Sharpe", ascending=False).round(3))
 
@@ -1087,6 +1269,11 @@ def clean_holdings(df):
     return tuple((t, float(v)) for t, v in d.items())
 
 
+def goal_header(what, now_value, rec_value):
+    """The two lines above each goal slider: where you are now, and what we recommend."""
+    st.markdown(f"Your portfolio's {what} right now: **{now_value}**  \nWhat we recommend: **{rec_value}**")
+
+
 def action_label(cur, new, total):
     if cur == 0:
         return "🟢 New buy"
@@ -1103,14 +1290,15 @@ def action_label(cur, new, total):
 def existing_tab():
     st.subheader("Improve a portfolio you already own")
     st.write("Enter your holdings, see how your portfolio scores on CAPM, Fama-French and the Sharpe ratio, "
-             "then set your goals. We recommend weight changes and substitute stocks to reach them.")
+             "then set your goals. We recommend weight changes, new stocks for any new money, and substitutes "
+             "to reach them.")
 
     st.session_state.setdefault("exp_holdings", tuple(EXAMPLE_HOLDINGS))
     st.session_state.setdefault("exp_window", DEFAULT_WINDOW_YEARS)
     st.session_state.setdefault("exp_seed", 0)
 
     # ---------- 1. holdings input
-    st.markdown("#### 1. Your current portfolio")
+    st.markdown("#### 1. Input your current portfolio")
     with st.form("holdings_form"):
         edited = st.data_editor(
             pd.DataFrame(EXAMPLE_HOLDINGS, columns=["Ticker", "$ Amount"]),
@@ -1164,45 +1352,86 @@ def existing_tab():
         sharpe_explanation(now, model)
         capm_box(now, model)
         ff_box(now, model)
-        st.dataframe(model["stats"].loc[tickers, ["Company", "Beta (adj)", "Alpha", "FF Mkt", "FF SMB", "FF HML",
+        st.dataframe(model["stats"].loc[tickers, ["Company", "Beta", "Alpha", "FF Mkt", "FF SMB", "FF HML",
                                                  "FF E[R]", "Volatility", "Sharpe"]].round(3))
         alpha_explanation(model, window)
 
     # ---------- 2. goals (defaults = our recommendations)
     st.markdown("#### 2. Set your goals")
-    st.write("Each slider starts at our recommendation. Move it to whatever you want; the explanation says why we suggest it.")
+    st.write("For each goal you'll see where your portfolio is right now and what we recommend. Each slider "
+             "starts at our recommendation; move it to whatever you want, then click **Update recommendations**.")
     allow_cash = st.session_state.get("exp_cash", True)   # read before the form so recommendations match it
     rec = recommended_settings(tuple(holdings), window, extra, allow_cash)
     sig = abs(hash((tuple(holdings), window, allow_cash)))   # sliders reset when the portfolio changes
     with st.form("goals_form"):
+        rel_now = w_cur / w_cur.sum()          # each stock's share of the stock part today
+
+        st.markdown("**T-bills (cash)**")
         st.checkbox("Allow T-bills (cash) in the recommendation", value=True, key="exp_cash")
-        explain("T-bills have beta 0. Mixing them with your best stock mix can lower risk without lowering the "
-                "Sharpe ratio (Capital Allocation Line). Turn off to stay 100% in stocks. Click **Update** after changing.")
-        t_beta = st.slider("Target beta (CAPM market risk)", 0.3, 2.0, rec["beta"], 0.05, key=f"tb{sig}")
-        explain(f"We recommend **{rec['beta']:.2f}**: your beta today, so we don't change how much market risk "
-                "you take unless you ask. Lower = calmer portfolio; higher = bigger swings (and a higher CAPM return).")
-        t_sharpe = st.slider("Target Sharpe ratio", 0.0, 1.5, rec["sharpe"], 0.01, key=f"ts{sig}")
-        explain(f"Your Sharpe today is {now['sharpe']:.2f}. We recommend **{rec['sharpe']:.2f}**, the best your "
-                "current stocks can reach **just by changing weights**"
-                + (" (and adding T-bills)" if allow_cash else "") + " at your current beta. "
-                "Set it higher and we'll suggest substitute stocks; set it lower and we'll make fewer changes.")
-        t_smb = st.slider("Size tilt (Fama-French SMB)", -0.6, 1.0, rec["smb"], 0.05, key=f"tsmb{sig}")
-        explain(f"Today: {now['smb']:+.2f} ({size_word(now['smb'])}). We recommend **{rec['smb']:+.2f}**, the size "
-                "tilt of the highest-Sharpe version of your portfolio. Higher = more like small companies "
-                "(historically higher return, more risk); lower = more like large ones.")
-        t_hml = st.slider("Value tilt (Fama-French HML)", -0.8, 0.8, rec["hml"], 0.05, key=f"thml{sig}")
-        explain(f"Today: {now['hml']:+.2f} ({value_word(now['hml'])}). We recommend **{rec['hml']:+.2f}** for the "
-                "same reason. Higher = more value stocks (cheap vs. book value); lower = more growth stocks.")
-        c1, c2 = st.columns(2)
-        with c1:
-            min_pct = st.slider("Minimum position (% of stocks)", 0.0, 20.0, rec["w_min"] * 100, 0.5, key=f"mn{sig}")
-            explain(f"We recommend **{rec['w_min']:.1%}**, half an equal share (1/{n}), so every stock is big enough to matter.")
-        with c2:
-            max_pct = st.slider("Maximum position (% of stocks)", 5.0, 100.0, rec["w_max"] * 100, 0.5, key=f"mx{sig}")
-            explain(f"We recommend **{rec['w_max']:.1%}**, double an equal share, so no single company can sink the portfolio.")
-        max_swaps = st.slider("Max substitute stocks", 0, 5, 2, key=f"sw{sig}")
-        explain("We recommend **2**: enough to fix most portfolios without replacing everything you own. "
-                "We only substitute if changing weights alone can't reach your goals.")
+        explain("T-bills have beta 0. Mixing them with your best stock portfolio can lower risk without lowering "
+                "the Sharpe ratio. Turn off to stay 100% in stocks. Click **Update recommendations** after changing.")
+
+        st.markdown("**Target beta (CAPM market risk)**")
+        goal_header("beta", f"{now['beta']:.2f}", f"{rec['beta']:.2f}")
+        t_beta = st.slider("Target beta", 0.3, 2.0, rec["beta"], 0.05, key=f"tb{sig}", label_visibility="collapsed")
+        explain(f"We recommend **{rec['beta']:.2f}** because it's your beta today, so we don't change how much "
+                "market risk you take unless you ask. Lower = calmer portfolio; higher = bigger swings "
+                "(and a higher CAPM expected return).")
+
+        st.markdown("**Target Sharpe ratio**")
+        goal_header("Sharpe ratio", f"{now['sharpe']:.2f}", f"{rec['sharpe']:.2f}")
+        t_sharpe = st.slider("Target Sharpe ratio", 0.0, 1.5, rec["sharpe"], 0.01, key=f"ts{sig}",
+                             label_visibility="collapsed")
+        explain(f"We recommend **{rec['sharpe']:.2f}** because it's the best your current stocks can reach **just by "
+                "changing weights**" + (" (and adding T-bills)" if allow_cash else "") + " at your current beta. "
+                "Set it higher and we'll suggest new or substitute stocks; set it lower and we'll make fewer changes.")
+
+        st.markdown("**Size tilt (Fama-French SMB)**")
+        goal_header("size tilt", f"{now['smb']:+.2f} ({size_word(now['smb'])})", f"{rec['smb']:+.2f}")
+        t_smb = st.slider("Size tilt", -0.6, 1.0, rec["smb"], 0.05, key=f"tsmb{sig}", label_visibility="collapsed")
+        explain(f"We recommend **{rec['smb']:+.2f}** because it's the size tilt of the highest-Sharpe version of your "
+                "portfolio. Higher = more like small companies (historically higher return, more risk); "
+                "lower = more like large ones.")
+
+        st.markdown("**Value tilt (Fama-French HML)**")
+        goal_header("value tilt", f"{now['hml']:+.2f} ({value_word(now['hml'])})", f"{rec['hml']:+.2f}")
+        t_hml = st.slider("Value tilt", -0.8, 0.8, rec["hml"], 0.05, key=f"thml{sig}", label_visibility="collapsed")
+        explain(f"We recommend **{rec['hml']:+.2f}** for the same reason. Higher = more value stocks (cheap vs. book "
+                "value); lower = more growth stocks.")
+
+        st.markdown("**Minimum position size (% of the stock portfolio)**")
+        goal_header("smallest position", f"{rel_now.min():.1%} ({tickers[int(np.argmin(rel_now))]})", f"{rec['w_min']:.1%}")
+        min_pct = st.slider("Minimum position", 0.0, 20.0, rec["w_min"] * 100, 0.5, key=f"mn{sig}",
+                            label_visibility="collapsed", format="%.1f%%")
+        explain(f"We recommend **{rec['w_min']:.1%}**, half an equal share (1/{n} of the stocks), so every stock is "
+                "big enough to matter.")
+
+        st.markdown("**Maximum position size (% of the stock portfolio)**")
+        goal_header("largest position", f"{rel_now.max():.1%} ({tickers[int(np.argmax(rel_now))]})", f"{rec['w_max']:.1%}")
+        max_pct = st.slider("Maximum position", 5.0, 100.0, rec["w_max"] * 100, 0.5, key=f"mx{sig}",
+                            label_visibility="collapsed", format="%.1f%%")
+        explain(f"We recommend **{rec['w_max']:.1%}**: double an equal share, but never above "
+                f"{MAX_POSITION_CAP:.0%}, the one-company limit U.S. tax rules use for diversified mutual funds. "
+                "That way no single company can sink the portfolio."
+                + (" (With only 2–3 stocks the cap has to be higher so the weights can add to 100%.)" if n < 4 else ""))
+
+        st.markdown("**Max substitute stocks**")
+        st.markdown("What we recommend: **2**")
+        max_swaps = st.slider("Max substitute stocks", 0, 5, 2, key=f"sw{sig}", label_visibility="collapsed")
+        explain("We recommend **2** because it's enough to fix most portfolios without replacing everything you own. "
+                "We only substitute if changing weights (and adding stocks with new money) can't reach your goals.")
+
+        st.markdown("**Additional investment (optional)**")
+        new_money = st.number_input("Additional investment ($)", min_value=0, value=0, step=500, key=f"nm{sig}")
+        explain("Money you want to add to the portfolio. We **first** invest it by adjusting the weights of what you "
+                "already own (and T-bills, if allowed), and only add new stocks if that can't reach your goals.")
+
+        st.markdown("**Max new stocks to add**")
+        st.markdown("What we recommend: **2**")
+        max_add = st.slider("Max new stocks to add", 0, 5, 2, key=f"ad{sig}", label_visibility="collapsed")
+        explain("We recommend **2**. A new stock is added **only when necessary**: when reweighting alone misses a goal "
+                "and the stock clearly improves the portfolio. Adding uses your new money, so nothing has to be sold. "
+                "Only applies when the additional investment is above $0.")
         submitted = st.form_submit_button("Update recommendations", type="primary")
     if submitted:
         st.session_state["exp_seed"] = 0
@@ -1216,28 +1445,36 @@ def existing_tab():
     # ---------- 3. recommendations
     st.markdown("#### 3. Our recommendations")
     b1, b2 = st.columns(2)
-    if b1.button("🔀 Shuffle substitutes", key="exp_shuffle"):
+    if b1.button("🔀 Shuffle new/substitute stocks", key="exp_shuffle"):
         st.session_state["exp_seed"] += 1
-    if b2.button("↩️ Back to best substitutes", key="exp_reset"):
+    if b2.button("↩️ Back to best picks", key="exp_reset"):
         st.session_state["exp_seed"] = 0
     seed = st.session_state["exp_seed"]
 
     targets = (t_beta, t_sharpe, t_smb, t_hml)
-    res = recommend(tuple(holdings), window, extra, targets, w_min, w_max, max_swaps, seed, allow_cash)
+    res = recommend(tuple(holdings), window, extra, targets, w_min, w_max, max_swaps, seed, allow_cash,
+                    float(new_money), int(max_add))
     before, after = res["before"], res["after"]
     tdict = dict(zip(["beta", "sharpe", "smb", "hml"], targets))
     met = targets_met(after, tdict)
 
     summary = f"Sharpe ratio **{before['sharpe']:.2f} → {after['sharpe']:.2f}**, beta **{before['beta']:.2f} → {after['beta']:.2f}**."
+    if res["new_money"] > 0:
+        summary += f" We invest your **${res['new_money']:,.0f}** of new money"
+        summary += (f" and add **{len(res['adds'])} new stock(s)**." if res["adds"]
+                    else " in what you already own (no new stocks needed).")
+    changes = []
     if res["swaps"]:
-        summary += f" We changed weights and suggest **{len(res['swaps'])} substitute stock(s)**."
-    else:
-        summary += " We only changed weights." + (" No substitutes needed." if all(met.values()) else "")
+        changes.append(f"suggest **{len(res['swaps'])} substitute stock(s)**")
+    if changes:
+        summary += " We also " + " and ".join(changes) + "."
+    elif res["new_money"] == 0:
+        summary += " We only changed weights." + (" No new or substitute stocks needed." if all(met.values()) else "")
     if res["c_final"] > res["c_cur"] + 0.005:
         summary += f" T-bills go from {res['c_cur']:.0%} to **{res['c_final']:.0%}**."
     st.success(summary)
     if seed > 0:
-        st.info(f"Shuffle #{seed}: each substitute was drawn at random from the 5 best replacements, "
+        st.info(f"Shuffle #{seed}: each new or substitute stock was drawn at random from the 5 best candidates, "
                 "so you can see other options.")
 
     def yes(k):
@@ -1263,10 +1500,25 @@ def existing_tab():
                                  reference=before["sharpe"]))
     explain("The number under the gauge shows the change from your Sharpe ratio today.")
 
+    s = model["stats"]
+    # new stocks bought with new money
+    if res["adds"]:
+        st.markdown("**New stocks to buy with your new money**")
+        for ad in res["adds"]:
+            i = s.loc[ad["in"]]
+            alts = ", ".join(f"{a} ({company(a)})" for a in ad["alternatives"]) or "none"
+            st.markdown(
+                f"- **Add {ad['in']} ({i['Company']}, {i['Sector']})**  \n"
+                f"  Why: reweighting what you own couldn't reach your goals, and {ad['in']} (beta "
+                f"{i['Beta']:.2f}, {size_word(i['FF SMB'])}, {value_word(i['FF HML'])}, stock Sharpe "
+                f"{i['Sharpe']:.2f}) improved the portfolio the most.  \n  Other good options: {alts}")
+    elif res["new_money"] > 0 and max_add > 0:
+        explain("No new stocks needed: investing the new money in what you already own gets as close to your "
+                "goals as adding a stock would.")
+
     # substitutions
     if res["swaps"]:
         st.markdown("**Substitute stocks**")
-        s = model["stats"]
         for sw in res["swaps"]:
             o, i = s.loc[sw["out"]], s.loc[sw["in"]]
             alts = ", ".join(f"{a} ({company(a)})" for a in sw["alternatives"]) or "none"
@@ -1275,7 +1527,7 @@ def existing_tab():
             st.markdown(
                 f"- **Replace {sw['out']} ({o['Company']}) with {sw['in']} ({i['Company']}, {i['Sector']})**  \n"
                 f"  Why: {sw['out']} has {which} expected return per unit of risk among your original stocks "
-                f"(stock Sharpe {o['Sharpe']:.2f}). {sw['in']} (beta {i['Beta (adj)']:.2f}, "
+                f"(stock Sharpe {o['Sharpe']:.2f}). {sw['in']} (beta {i['Beta']:.2f}, "
                 f"{size_word(i['FF SMB'])}, {value_word(i['FF HML'])}, stock Sharpe {i['Sharpe']:.2f}) "
                 f"moved the portfolio closest to your goals.  \n  Other good options: {alts}")
     elif max_swaps == 0:
@@ -1291,33 +1543,48 @@ def existing_tab():
     if show_cash:
         cur_w[CASH], new_w[CASH] = res["c_cur"], res["c_final"]
     cur_d = dict(zip(labels, to_dollars([cur_w.get(t, 0.0) for t in labels], res["total"])))
-    new_d = dict(zip(labels, to_dollars([new_w.get(t, 0.0) for t in labels], res["total"])))
+    new_d = dict(zip(labels, to_dollars([new_w.get(t, 0.0) for t in labels], res["new_total"])))
     cur_p = dict(zip(labels, to_pct([cur_w.get(t, 0.0) for t in labels])))
     new_p = dict(zip(labels, to_pct([new_w.get(t, 0.0) for t in labels])))
     trades = pd.DataFrame([{
         "Holding": t, "Company": company(t),
         "Now $": cur_d[t], "Now %": cur_p[t], "Recommended %": new_p[t], "Recommended $": new_d[t],
         "Change $": round(new_d[t] - cur_d[t], 2),
-        "Action": action_label(cur_d[t], new_d[t], res["total"]),
+        "Action": action_label(cur_d[t], new_d[t], res["new_total"]),
     } for t in labels])
     money = st.column_config.NumberColumn(format="$%.2f")
     pct = st.column_config.NumberColumn(format="%.1f%%")
     st.dataframe(trades, hide_index=True, column_config={
         "Now $": money, "Recommended $": money, "Change $": money, "Now %": pct, "Recommended %": pct})
+    buys = trades.loc[trades["Change $"] > 0, "Change $"].sum()
+    sells = -trades.loc[trades["Change $"] < 0, "Change $"].sum()
+    line = f"**Buys:** ${buys:,.2f} · **Sells:** ${sells:,.2f}"
+    if res["new_money"] > 0:
+        line += (f" · **New money:** ${res['new_money']:,.2f} "
+                 f"(portfolio grows from ${res['total']:,.0f} to ${res['new_total']:,.0f})")
+    st.write(line)
     st.plotly_chart(compare_bars(labels, cur_p, new_p))
 
     with st.expander("🔍 How did we come up with these recommendations?"):
         st.markdown(f"""
+**We always make the least disruptive changes first:**
+**① change the weights of what you own → ② add new stocks with new money (nothing sold) → ③ replace stocks (selling).**
+If you're adding new money, we first try to invest it in the stocks you already own by adjusting their weights.
+We only add a new stock if that can't reach your goals.
+
 1. **Measure today's portfolio.** Your weights are your dollars ÷ ${res['total']:,.0f}. Beta, size, value and alpha are
    weighted averages of each holding's regression results (T-bills count as 0); volatility uses the covariance matrix.
 2. **Change weights first.** An optimizer looks for the **smallest change to your weights** that gets beta, size,
    value and Sharpe as close as possible to your goals, keeping every stock between {w_min:.1%} and {w_max:.1%}
    of the stock part{' and up to ' + format(MAX_CASH, '.0%') + ' in T-bills' if allow_cash else ''}.
+   New money is included here: weights are shares of ${res['new_total']:,.0f}, and what you own today is the starting point.
    Reweighting alone gives a Sharpe of **{res['reweight']['sharpe']:.2f}** and beta **{res['reweight']['beta']:.2f}**.
-3. **Substitute only if needed.** If a goal is still missed, we replace your stock with the lowest *expected* stock
-   Sharpe. We test **every stock in our universe** as its replacement and keep the one that gets closest to your goals,
-   up to {max_swaps} substitute(s). **Shuffle** picks among the 5 best replacements instead.
-4. **A goal is 'reached'** when beta is within ±{TOLERANCE['beta']}, size/value within ±{TOLERANCE['smb']},
+3. **Add new stocks only if needed** (only with new money, up to {max_add}). If a goal is still missed, we shortlist the
+   **{SHORTLIST_SIZE} stocks** with the best mix of expected Sharpe and closeness to your beta, size and value goals,
+   test adding each one, and add the best, but only if it clearly improves the portfolio.
+4. **Substitute only if still needed.** We replace your stock with the lowest *expected* stock Sharpe, testing the same
+   kind of shortlist as replacements, up to {max_swaps} substitute(s). **Shuffle** picks among the 5 best candidates instead.
+5. **A goal is 'reached'** when beta is within ±{TOLERANCE['beta']}, size/value within ±{TOLERANCE['smb']},
    and the Sharpe ratio is at or above your target.
 """)
 
@@ -1329,7 +1596,15 @@ def existing_tab():
 # columns automatically on a phone.
 st.set_page_config(page_title="Robo-Advisor", page_icon="📈", layout="centered")
 st.title("Automated Financial Advisor")
-st.caption("AC420 Project · Lydia Pelton & Sydney Pitts · Data: Yahoo Finance + Kenneth French Data Library")
+_ff_source = load_fama_french()[1] or ""
+st.caption("AC420 Project · Lydia Pelton & Sydney Pitts · Data: "
+           + ("WRDS (Fama-French factors)" if _ff_source.startswith("WRDS") else "Kenneth French Data Library")
+           + " · Yahoo Finance · S&P 500 list")
+
+# Load the stock universe (S&P 500 + small/mid names) for every function above to use
+UNIVERSE, UNIVERSE_SOURCE = load_universe()
+if UNIVERSE_SOURCE.startswith("built-in"):
+    st.warning("Couldn't download the S&P 500 list, so the app is using its smaller built-in list of stocks.")
 
 tab_home, tab_start, tab_improve = st.tabs(["🏠 Home", "🌱 Start from scratch", "📈 Improve my portfolio"])
 with tab_home:
